@@ -165,7 +165,9 @@ jobs:
     if: |
       always() &&
       (needs.create-git-tag.result == 'success' || needs.create-git-tag.result == 'skipped')
-    runs-on: windows-latest
+    # Pinned to windows-2022: scripts/build_picoquic_windows.ps1 uses the
+    # "Visual Studio 17 2022" CMake generator, which windows-latest no longer ships.
+    runs-on: windows-2022
     timeout-minutes: 90
     env:
       TARGET: x86_64-pc-windows-msvc
@@ -204,10 +206,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed (exit $LASTEXITCODE)" }
           Write-Host "::endgroup::"
 
+          $root = Join-Path $vcpkgRoot "installed\$env:VCPKG_TRIPLET"
+          $pkgconfDir = Join-Path $root "tools\pkgconf"
+          $pkgconfExe = Join-Path $pkgconfDir "pkgconf.exe"
+          if (-not (Test-Path $pkgconfExe)) {
+            throw "pkgconf.exe not found at $pkgconfExe"
+          }
+
+          # Put pkgconf on PATH for later steps (fallback for CMake's search;
+          # build_picoquic_windows.ps1 also reads PKG_CONFIG_EXECUTABLE directly).
+          Add-Content -Path $env:GITHUB_PATH -Value $pkgconfDir -Encoding utf8
+
           # Export OpenSSL settings to later steps.
           # (Write-Host does not write to GITHUB_ENV; Add-Content does.)
-          $root = Join-Path $vcpkgRoot "installed\$env:VCPKG_TRIPLET"
-          $pkgconfExe = Join-Path $root "tools\pkgconf\pkgconf.exe"
           @(
             "OPENSSL_DIR=$root",
             "OPENSSL_ROOT_DIR=$root",
@@ -215,18 +226,21 @@ jobs:
             "OPENSSL_INCLUDE_DIR=$root\include",
             "OPENSSL_STATIC=1",
             "OPENSSL_USE_STATIC_LIBS=ON",
-            "PKG_CONFIG_EXECUTABLE=$pkgconfExe"
+            "PKG_CONFIG_EXECUTABLE=$pkgconfExe",
+            "PKG_CONFIG_PATH=$root\lib\pkgconfig"
           ) | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
           Write-Host "OpenSSL root: $root"
           Write-Host "PKG_CONFIG_EXECUTABLE: $pkgconfExe"
 
+      # Uses the Windows-specific script (VS generator, OpenSSL staging, picotls
+      # compat overlay, pkgconf passthrough). It exports PICOQUIC_INCLUDE_DIR,
+      # PICOQUIC_LIB_DIR and PICOTLS_INCLUDE_DIR to GITHUB_ENV for the cargo step.
       - name: Build picoquic
-        env:
-          CARGO_FEATURE_PICOQUIC_MINIMAL_BUILD: 1
+        shell: pwsh
         run: |
-          echo "::group::picoquic"
-          bash scripts/build_picoquic.sh
-          echo "::endgroup::"
+          Write-Host "::group::picoquic"
+          ./scripts/build_picoquic_windows.ps1
+          Write-Host "::endgroup::"
 
       - name: Build slipstream-client-ffi
         env:
@@ -234,8 +248,9 @@ jobs:
           BUILD_TYPE: Release
           PICOQUIC_FETCH_PTLS: ON
           CARGO_FEATURE_PICOQUIC_MINIMAL_BUILD: 1
-          RUSTFLAGS: "-C link-arg=-lc"
-          # OPENSSL_* variables come from GITHUB_ENV (set in the vcpkg step).
+          # OPENSSL_* and PICOQUIC_*/PICOTLS_* variables come from GITHUB_ENV
+          # (set by the vcpkg step and build_picoquic_windows.ps1).
+          # NOTE: removed RUSTFLAGS "-C link-arg=-lc": invalid for the MSVC linker.
         run: |
           echo "::group::cargo build"
           cargo build --release --target "${TARGET}" -p slipstream-client-ffi
